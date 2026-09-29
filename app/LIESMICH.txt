@@ -1,0 +1,10 @@
+PJ Print – Brother PocketJet ohne Herstellertreiber
+
+1. "PJ Print.app" nach links in den Applications-Ordner ziehen.
+2. App starten, Datei wählen, Ziel wählen – fertig.
+
+Voraussetzung für USB: einmalig eine CUPS-Raw-Queue anlegen.
+   lpinfo -v | grep -i brother
+   sudo lpadmin -p PJ663 -E -v "usb://Brother/PJ-663?serial=XXXX" -m raw
+
+Bluetooth (nur PJ-663): koppeln, dann taucht /dev/tty.PJ-663… in der Liste auf.

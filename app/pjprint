@@ -1,0 +1,190 @@
+#!/bin/bash
+# PJ Print - GUI-Launcher fuer pj_print.py
+set -u
+
+# --- Rosetta vermeiden: die Wheels im venv sind arm64 -----------------------
+if [ "$(/usr/sbin/sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ]; then
+  exec /usr/bin/arch -arm64 /bin/bash "$0" "$@"
+fi
+# hw.optional.arm64 stimmt auch dann, wenn bash selbst uebersetzt laeuft
+ARCHPFX=()
+if [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ] && [ -x /usr/bin/arch ]; then
+  ARCHPFX=(/usr/bin/arch -arm64)
+fi
+
+APPDIR="$(cd "$(dirname "$0")/.." && pwd)"
+RES="$APPDIR/Resources"
+SCRIPT="$RES/pj_print.py"
+PY="$RES/venv/bin/python3"
+CONF="$HOME/Library/Preferences/media.marswalk.pjprint.conf"
+OSA=/usr/bin/osascript
+BACKEND=/usr/libexec/cups/backend/usb
+
+MODEL=pj663
+QUALITY=threshold
+DENSITY=120
+PAPER=a4
+LAST=""
+[ -f "$CONF" ] && . "$CONF"
+
+py() { "${ARCHPFX[@]}" "$PY" "$@"; }
+
+# ---------------------------------------------------------------- Dialoge ---
+say() {
+  "$OSA" - "$1" "$2" <<'AS' >/dev/null 2>&1
+on run argv
+  display dialog (item 1 of argv) buttons {"OK"} default button 1 ¬
+    with title "PJ Print" with icon ((item 2 of argv) as integer)
+end run
+AS
+}
+
+pick_from() {
+  "$OSA" - "$1" "$2" <<'AS' 2>/dev/null
+on run argv
+  set AppleScript's text item delimiters to linefeed
+  set lst to text items of (item 1 of argv)
+  set AppleScript's text item delimiters to ""
+  set c to choose from list lst with prompt (item 2 of argv) with title "PJ Print"
+  if c is false then return ""
+  return item 1 of c
+end run
+AS
+}
+
+save_conf() {
+  mkdir -p "$(dirname "$CONF")"
+  printf 'MODEL=%s\nQUALITY=%s\nDENSITY=%s\nPAPER=%s\nLAST=%s\n' \
+    "$MODEL" "$QUALITY" "$DENSITY" "$PAPER" "$LAST" > "$CONF"
+}
+
+settings() {
+  local m q p d
+  m=$(pick_from "pj663 – PocketJet 6 Plus, 300 dpi
+pj662 – PocketJet 6 Plus, 200 dpi
+pj623 – PocketJet 6, 300 dpi
+pj622 – PocketJet 6, 200 dpi
+pj673 – PocketJet 673, 300 dpi
+pj763 – PocketJet 763, 300 dpi
+pj773 – PocketJet 773, 300 dpi
+pj822 – PocketJet 822, 200 dpi
+pj823 – PocketJet 823, 300 dpi" "Welches Druckermodell?")
+  [ -n "$m" ] && MODEL="${m%% *}"
+  q=$(pick_from "Text / Strichzeichnung (scharf)
+Foto (Dithering)" "Wie soll gerastert werden?")
+  case "$q" in Foto*) QUALITY=fs ;; Text*) QUALITY=threshold ;; esac
+  p=$(pick_from "A4
+Letter
+Legal
+A5" "Papierformat?")
+  [ -n "$p" ] && PAPER=$(echo "$p" | tr 'A-Z' 'a-z')
+  d=$(pick_from "normal (Stufe 5)
+dunkler (Stufe 7)
+sehr dunkel (Stufe 10)
+heller (Stufe 3)" "Schwaerzung?")
+  case "$d" in dunkler*) DENSITY=170 ;; sehr*) DENSITY=250 ;; heller*) DENSITY=80 ;; normal*) DENSITY=120 ;; esac
+  save_conf
+}
+
+# ------------------------------------------------------------ Vorbedingung ---
+[ -x "$PY" ] || PY=/usr/bin/python3
+if ! py -c "import PIL" >/dev/null 2>&1; then
+  ERR=$(py -c "import PIL" 2>&1 | tail -3)
+  say "Python-Umgebung defekt:
+
+$ERR" 0
+  exit 1
+fi
+
+# --------------------------------------------------------------- Ablauf 1 ---
+FILE=$("$OSA" -e 'try' \
+  -e 'return POSIX path of (choose file with prompt "Was soll gedruckt werden?")' \
+  -e 'on error' -e 'return ""' -e 'end try' 2>/dev/null)
+[ -z "$FILE" ] && exit 0
+
+# --------------------------------------------------------------- Ablauf 2 ---
+TARGETS=""
+while IFS= read -r uri; do
+  [ -n "$uri" ] && TARGETS="$TARGETS$uri
+"
+done < <(/usr/sbin/lpinfo -v 2>/dev/null | /usr/bin/awk '/usb:\/\// {print $2}')
+while IFS= read -r q; do
+  [ -n "$q" ] && TARGETS="${TARGETS}Warteliste: $q
+"
+done < <(/usr/bin/lpstat -p 2>/dev/null | /usr/bin/awk '/^[Dd]rucker|^printer/ {print $2}')
+for dev in /dev/tty.PJ* /dev/tty.PocketJet*; do
+  [ -e "$dev" ] && TARGETS="$TARGETS$dev
+"
+done
+TARGETS="${TARGETS}Nur Vorschau (PNG auf dem Schreibtisch)
+⚙︎ Modell / Qualitaet / Papier aendern"
+
+HT=$( [ "$QUALITY" = fs ] && echo Foto || echo Text )
+TARGET=$(pick_from "$TARGETS" "Wohin drucken?  [$MODEL · $PAPER · $HT]")
+[ -z "$TARGET" ] && exit 0
+
+if [ "${TARGET#⚙︎}" != "$TARGET" ]; then
+  settings
+  TARGET=$(pick_from "$TARGETS" "Wohin drucken?  [$MODEL · $PAPER]")
+  [ -z "$TARGET" ] && exit 0
+fi
+
+# --------------------------------------------------------------- Ablauf 3 ---
+BASE="$(basename "${FILE%.*}")"
+ARGS=(--model "$MODEL" --paper "$PAPER" --halftone "$QUALITY" --density "$DENSITY")
+JOB="/tmp/pjprint-$$.prn"
+
+run_py() {
+  ERR=$(py "$SCRIPT" "$FILE" "${ARGS[@]}" 2>&1 >/dev/null); RC=$?
+  [ $RC -ne 0 ] && { say "Aufbereitung fehlgeschlagen:
+
+$ERR" 0; exit 1; }
+}
+
+case "$TARGET" in
+
+  "Nur Vorschau"*)
+    ARGS+=(--preview "$HOME/Desktop/$BASE-vorschau.png")
+    run_py
+    /usr/bin/open "$HOME/Desktop/"
+    say "Vorschau liegt auf dem Schreibtisch.
+
+$ERR" 1
+    ;;
+
+  /dev/tty.*)
+    ARGS+=(--serial "$TARGET"); run_py
+    say "An $TARGET geschickt.
+
+$ERR" 1
+    ;;
+
+  usb://*)
+    ARGS+=(--out "$JOB"); run_py
+    OUT=$(DEVICE_URI="$TARGET" "$BACKEND" 1 "$USER" "PJ Print" 1 "" "$JOB" 2>&1); RC=$?
+    if [ $RC -ne 0 ]; then
+      # zweiter Versuch mit Administratorrechten
+      Q=$(printf '%s' "$TARGET" | sed "s/'/'\\\\''/g")
+      OUT=$("$OSA" -e "do shell script \"DEVICE_URI='$Q' $BACKEND 1 $USER PJPrint 1 '' $JOB\" with administrator privileges" 2>&1); RC=$?
+    fi
+    rm -f "$JOB"
+    if [ $RC -ne 0 ]; then
+      say "USB-Ausgabe fehlgeschlagen:
+
+$OUT" 0; exit 1
+    fi
+    say "Gedruckt über $TARGET
+
+$ERR" 1
+    ;;
+
+  "Warteliste: "*)
+    Q="${TARGET#Warteliste: }"
+    ARGS+=(--cups "$Q"); run_py
+    say "An Warteliste $Q geschickt.
+
+$ERR" 1
+    ;;
+esac
+
+LAST="$TARGET"; save_conf
